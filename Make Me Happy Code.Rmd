@@ -1,0 +1,952 @@
+---
+title: "STAT541 Final"
+author: "Brandon Fantine"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preparing the R environment
+
+```{r, message=FALSE, warning=FALSE}
+
+# Uncomment the below as necessary depending on what ML libraries need to be 
+# downloaded
+
+#install.packages("haven")
+#install.packages("mltools")
+#install.packages("keras")
+#install.packages("tensorflow")
+#install_keras()
+#install_tensorflow()
+#install.packages("fpc")
+
+# Import all necessary libraries
+library(haven)
+library(MASS) 
+library(ggplot2) 
+library(dplyr) 
+library(cluster)
+library(fpc)
+library(mltools)
+library(data.table)
+library(keras)
+library(tensorflow)
+library(reticulate)
+
+# Verify properly downloaded/imported NumPy and TensorFlow configurations
+py_config()
+
+```
+
+Execute the following code if *either* NumPy or TensorFlow is missing.
+
+```{r}
+
+# Find path
+# pythonhome:   .../.virtualenvs/...
+py_config()
+
+# Replace the below paths as needed
+use_virtualenv("C:/Users/brand/OneDrive/Documents/.virtualenvs/r-tensorflow", 
+               required = TRUE)
+use_python("C:/Users/brand/OneDrive/Documents/.virtualenvs/r-tensorflow/Scripts/python.exe", 
+           required = TRUE)
+py_install("numpy")
+py_install("tensorflow")
+
+# Make sure to restart R at this point!
+
+```
+
+Again, like the comment said: restart R!
+
+```{r, message=FALSE}
+
+# Verify the python environment is working. You should see:
+# Python enviroment working!
+py_run_string("print('Python enviroment working!')")
+
+# Verify TensorFlow is working. You should see:
+# tf.Tensor(b'TensorFlow environment working!', shape=(), dtype=string)
+tf$constant("TensorFlow environment working!")
+
+# Verify NumPy is working
+np <- import("numpy")
+np$array(c(1, 2, 3))
+
+# We're good to go!
+# If you get a message declaring that R has encountered a fatal error, 
+# do not worry
+# Start a new R session, reload the libraries, and re-verify all environments are working
+
+```
+
+## Loading the Data
+
+```{r}
+
+# Change depending on where the GSS2022.dta file is located
+setwd("C:/Users/brand/Downloads/2022_stata/2022")
+
+set.seed(123)
+data <- read_dta("GSS2022.dta")
+
+# Only direct altering to the dataset. This transforms the "Age" variable into
+# a categorical value for encoding purposes
+data$age <- ifelse(data$age < 65, 1, 0)
+
+```
+
+```{r}
+
+# Function that processes the data, allowing us to select multiple features
+# with ease. Adds an ID column for merging purposes
+clean_data <- function(columns) {
+  data %>%
+    select("id", all_of(columns)) %>%
+    mutate(across(-id, as.factor)) %>%
+    filter(if_all(everything(), ~ grepl("[0-9]", .))) 
+}
+
+happy_data <- clean_data(c("happy"))
+
+character_data <- clean_data(c("life", "trust", "obey", "workhard", "feeldown"))
+
+wealth_data <- clean_data(c("income16", "rincom16", "satfin", "conrinc")) %>%
+  mutate(conrinc = as.numeric(as.character(conrinc)))
+
+reli_data <- clean_data(c("relig", "attend", "reliten", "pray", "god"))
+
+health_data <- clean_data(c("health", "disblty", "hlthprb", "docvst"))
+
+friend_data <- clean_data(c("socrel", "socommun", "socfrend", "socbar"))
+
+life_data <- clean_data(c("age", "race", "marital", "childs", "postlife")) %>%
+  mutate(age = as.numeric(as.character(age)), 
+         childs = as.numeric(as.character(childs)))
+
+leisure_data <- clean_data(c("yrlvmus", "yrartxbt", "yrmovie", "yrcreat", 
+                             "yrrdg", "yrtour", "yrstmus", "yrarmus", "yrstpo", 
+                             "yrarpo", "yrclass", "yrpod"))
+
+educ_data <- clean_data(c("educ"))
+
+```
+
+## Analysis functions
+
+```{r}
+
+# Function to split the data into training and test sets
+# Data is split 70% Training, 30% Testing
+# One-hot encodes all factors (categorical variables) for both the x and y 
+# components of each set
+train_test_split <- function(data){
+  i <- sample(1:nrow(data), size=0.7*nrow(data))
+  train <- data[i,]
+  test <- data[-i,]
+  
+  x_train <- as.matrix(one_hot(as.data.table(train[,2:ncol(train)])))
+  y_train <- as.matrix(one_hot(as.data.table(train[,1])))
+  
+  x_test <- as.matrix(one_hot(as.data.table(test[,2:ncol(test)])))
+  y_test <- as.matrix(one_hot(as.data.table(test[,1])))
+  
+  return(list(x_train=x_train, x_test=x_test, y_train=y_train, y_test=y_test))
+}
+
+```
+
+```{r}
+
+# Function that creates an ANN using TensorFlow
+# Initalized with layes of size 64, 32, and 3; 50 epochs; batch sizes of 10;
+# and a value split of 20%
+# Makes use of a SoftMax output layer + Categorical Cross-Entropy loss function
+ann_predict <- function(data, epochs=50, bsize=10, vsplit=0.2, u1=64, u2=32){
+  model <- keras_model_sequential() %>%
+  layer_dense(units = u1, activation = "relu", 
+              input_shape = ncol(data$x_train)) %>%
+  layer_dense(units = u2, activation = "relu") %>%
+  layer_dense(units = 3, activation = "softmax")
+
+  model %>% compile(
+    optimizer = "adam",
+    loss = "categorical_crossentropy",
+    metrics = c("mae", "accuracy")
+  )
+  
+  history <- model %>% fit(
+    x = data$x_train,
+    y = data$y_train,
+    epochs = epochs,          
+    batch_size = bsize,   
+    validation_split = vsplit
+  )
+
+  metrics <- model %>% evaluate(data$x_test, data$y_test)
+  
+  predictions <- model %>% predict(data$x_test)
+  
+  # Convert prediction back to corresponding classes of 1, 2, or 3 for direct
+  # comparison
+  pred_class <- apply(predictions, 1, which.max)
+  
+  return(list(predictions=pred_class, metrics=metrics))
+}
+
+```
+
+```{r}
+
+
+# Function to run the ANN and compute the accuracy by comparing the ratio of 
+# correctly predicted values in the test set with the total number of 
+# predictions made.
+# Return that accuracy value and the results from the ANN
+classification_report <- function(data, epochs=50, bsize=10, vsplit=0.2, u1=64, u2=32){
+  ann_results <- ann_predict(data, epochs, bsize, vsplit)
+  
+  classification_table <- tibble(
+    Actual = apply(data$y_test, 1, which.max),
+    Predicted = ann_results$predictions
+  ) %>% mutate(Accurate = if_else(Actual == Predicted, "Y", "N"))
+  
+  accuracy <- (classification_table %>% filter(Accurate == "Y") %>% tally()) / nrow(classification_table)
+  
+  return(c(classification_table, accuracy))
+}
+
+```
+
+# Finding Natural Clusters
+
+```{r}
+
+# Function that executes spectral clustering, computing both the Silhouette
+# Score and CH-index using functions from the cluster() and fpc() packages
+spectral_clustering <- function(data, k) {
+  oh_encoded <- one_hot(as.data.table(data))
+  
+  sim_mat <- as.matrix(dist(oh_encoded, method = "binary"))
+  
+  # In case the variance is too small due to working with categorical variables
+  # Adjust as needed
+  adj_mat <- exp(-sim_mat^2 / (2 * max(1e-6, var(sim_mat))))
+  deg_mat <- diag(rowSums(adj_mat))
+  lap_mat <- deg_mat - adj_mat
+  
+  eig <- eigen(lap_mat)
+  evector <- eig$vectors[, 1:k]
+  
+  result <- kmeans(evector, centers = k)
+  
+  sil_score <- silhouette(result$cluster, dist(sim_mat))
+  ch_idx <- cluster.stats(d = dist(sim_mat), clustering = result$cluster)$ch
+  
+  return(list(clustering = result, 
+              sil_score = mean(sil_score[, 3]), 
+              ch = ch_idx))
+}
+
+```
+
+```{r}
+
+# Function that autoruns the Spectral Clustering algorithm to compute (and plot)
+# the Silhouette Scores and CH-Index for k = 2 through k = 10 clusters
+get_metrics <- function(data){
+  sil_scores <- numeric(10)
+  ch_idx <- numeric(10)
+
+  for (k in 2:10){
+    sil_scores[k] <- spectral_clustering(data, k)$sil_score
+    ch_idx[k] <- spectral_clustering(data, k)$ch
+  }
+  
+  plot(2:10, sil_scores[2:10], type="b", pch=19, 
+       xlab="Number of Clusters (k)", 
+       ylab="Silhouette Score")
+  
+  print(sil_scores)
+  print(ch_idx)
+}
+
+```
+
+## Initial ANN trials
+
+```{r}
+
+# Accuracy: 0.5421687
+masterc <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, character_data)) %>% select(-id)
+char_train_test <- train_test_split(masterc)
+classification_report(char_train_test)
+get_metrics(masterc)
+
+```
+
+```{r}
+
+# Accuracy: 0.2477876
+masterw <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, wealth_data)) %>% select(-id)
+wealth_train_test <- train_test_split(masterw)
+classification_report(wealth_train_test)
+get_metrics(masterw)
+
+```
+
+```{r}
+
+# Accuracy: 0.4129794
+masterr <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, reli_data)) %>% select(-id)
+reli_train_test <- train_test_split(masterr)
+classification_report(reli_train_test)
+get_metrics(masterr)
+
+```
+
+```{r}
+
+# Accuracy: 0.4834606
+masterh <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, health_data)) %>% select(-id)
+health_train_test <- train_test_split(masterh)
+classification_report(health_train_test)
+get_metrics(masterh)
+
+```
+
+```{r}
+
+# Accuracy: 0.4963325
+masterf <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, friend_data)) %>% select(-id)
+friend_train_test <- train_test_split(masterf)
+classification_report(friend_train_test)
+get_metrics(masterf)
+
+```
+
+```{r}
+
+# Accuracy: 0.5542725; Loss: 1.0203/0.9686
+masterlife <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, life_data)) %>% select(-id)
+life_train_test <- train_test_split(masterlife)
+classification_report(life_train_test)
+get_metrics(masterlife)
+
+```
+
+```{r}
+
+# Accuracy: 0.4747899
+masterleisure <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, leisure_data)) %>% select(-id)
+leisure_train_test <- train_test_split(masterleisure)
+classification_report(leisure_train_test)
+get_metrics(masterleisure)
+
+```
+
+Optimal ANN were characteristic and life! No meaningful clusters for either, implying that there do not exist any underlying relationships between the various factors in each of the prior sets. It is reasonable to assume, then, that we do not need to choose specific combinations of the variables. 
+
+In accuracy order: Life, Education, Characteristics, Friends, Health, Leisure, Religion, and Wealth. Let's Power Match before we individually pick apart any groupings. 
+
+## Combined ANN Trials
+
+```{r}
+
+set.seed(123)
+
+# Accuracy: 0.4884259; Loss: 1.0091/0.9151
+masterlife_educ <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, life_data, educ_data)) %>% select(-id)
+life_educ_train_test <- train_test_split(masterlife_educ)
+classification_report(life_educ_train_test)
+
+# Increase the size of layers to decrease loss
+# Accuracy: 0.5462963; Loss: 0.9815/0.9131
+classification_report(life_educ_train_test, u1=128, u2=64)
+
+# Accuracy: 0.5393519; Loss: 0.9504/0.9194
+classification_report(life_educ_train_test, u1=256, u2=128)
+
+```
+
+```{r}
+
+set.seed(123)
+
+# Accuracy: 0.5588235; Loss: 0.9826/0.6294
+# <500 Respondents; lower vsplit to 15%
+masterchar_educ <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, character_data, educ_data)) %>% select(-id)
+char_educ_train_test <- train_test_split(masterchar_educ)
+classification_report(char_educ_train_test, vsplit=.15)
+
+# Constant decrease of loss, increase Epochs until leveled
+# Accuracy: 0.5301205; Loss: 1.8674/0.1927
+classification_report(char_educ_train_test, epochs=70, vsplit=.15)
+
+# Increase the size of layers to decrease val_loss
+# Accuracy: 0.5060241; Loss: 1.7231/0.2012
+classification_report(char_educ_train_test, epochs=70, vsplit=.15, 
+                      u1=128, u2=64)
+
+# Accuracy: 0.4337349; Loss: 1.8208/0.214
+classification_report(char_educ_train_test, epochs=70, vsplit=.15, 
+                      u1=256, u2=128)
+
+```
+
+Note: we cannot combine Character + friend data groupings as there are no respondents who answered the character questions, friendship questions, and happiness questions. The same issues arises when tying to combine friend + health.
+
+```{r}
+
+set.seed(123)
+
+# <500 Respondents; lower vsplit to 15%
+# Accuracy: 0.5; Loss: 2.3985/0.1339
+# Loss is too high and sil scores too low. It implies that this combination is
+# ill-fit to model happiness
+masterhealth_leisure <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, health_data, leisure_data)) %>% select(-id)
+health_leisure_train_test <- train_test_split(masterhealth_leisure)
+classification_report(health_leisure_train_test, vsplit=.15)
+get_metrics(masterhealth_leisure)
+
+```
+
+```{r}
+
+set.seed(123)
+
+# <250 Respondents; lower vsplit to 10%
+# Accuracy: 0.4102564; Loss: 1.3906/0.0919
+masterleisure_reli <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, leisure_data, reli_data)) %>% select(-id)
+leisure_reli_train_test <- train_test_split(masterleisure_reli)
+classification_report(leisure_reli_train_test, vsplit=.10)
+
+# Increase the size of layers to decrease val_loss
+# Accuracy: 0.3589744; Loss: 1.9561/0.071
+classification_report(leisure_reli_train_test, vsplit=.10, u1=128, u2=64)
+
+# Decrease the size of layers to decrease val_loss
+# Accuracy: 0.3589744; Loss: 1.1721/0.0986
+classification_report(leisure_reli_train_test, vsplit=.10, u1=32, u2=16)
+
+```
+
+```{r}
+
+set.seed(123)
+
+# Accuracy: 0.502924; Loss: 100.8651/38.8797
+masterreli_wealth <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, reli_data, wealth_data)) %>% select(-id)
+reli_wealth_train_test <- train_test_split(masterreli_wealth)
+classification_report(reli_wealth_train_test)
+
+# Increase the size of layers to decrease all loss
+# Accuracy: 0.502924; Loss: 105.8375/63.7175
+classification_report(reli_wealth_train_test, u1=128, u2=64)
+
+```
+
+All the models performed similarly. Let's combine all variables and see what happens!
+
+## ANN Master Dataset Trials
+
+```{r}
+
+set.seed(123)
+
+mastermaster <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, life_data, character_data, leisure_data, 
+                      health_data, reli_data, wealth_data, educ_data)) %>% 
+  select(-id)
+
+# Only 19 respondents... Let's just see what happens, shall we?
+nrow(mastermaster)
+# Accuracy: 0.1666667
+mastermaster_train_test <- train_test_split(mastermaster)
+classification_report(mastermaster_train_test, vsplit = 0.1)
+
+# Remove Leisure data to increase numbers
+mastermaster2 <- Reduce(function(x, y) inner_join(x, y, by = "id"), 
+                 list(happy_data, life_data, character_data, 
+                      health_data, reli_data, wealth_data, educ_data)) %>% 
+  select(-id)
+
+# Still keep vsplit at 0.1
+# Accuracy: 0.5892857; Loss: 126.3298/110.8499
+# Our most accurate model!
+# This implies a combination of the above variables just might be the key
+mastermaster2_train_test <- train_test_split(mastermaster2)
+classification_report(mastermaster2_train_test, vsplit = 0.1)
+
+# Negative silhouette scores with optimal k=2 implies intense overfitting
+# Further, lots of misclassification
+# Could some variables be overlapping?
+get_metrics(mastermaster2)
+
+```
+
+## Varying Collection ANN Trials
+
+```{r}
+
+combo1 <- clean_data(c("happy", "age", "race", "marital", "childs", 
+                       "income16", "life", "relig", "god", "health", "educ")) %>% select(-id)
+
+combo1[1:5,]
+
+# Accuracy: 0.4649123; Loss: 2.7404/0.0338
+combo1_train_test <- train_test_split(combo1)
+classification_report(combo1_train_test)
+
+combo2 <- combo1 %>% select(-god)
+
+# Accuracy: 0.4883041; Loss: 2.9515/0.0236
+combo2_train_test <- train_test_split(combo2)
+classification_report(combo2_train_test)
+
+# Decrease Epochs
+# Accuracy: 0.5087719; Loss: 1.8069/0.2021
+classification_report(combo2_train_test, epochs=25)
+
+combo3 <- combo2 %>% select(-childs)
+
+# Accuracy: 0.494152; Loss: 2.7385/0.072
+combo3_train_test <- train_test_split(combo3)
+classification_report(combo3_train_test)
+
+# Decrease Epochs
+# Accuracy: 0.5292398; Loss: 1.5219/0.2658
+classification_report(combo3_train_test, epochs=25)
+
+# Check for underlying structure
+get_metrics(combo3)
+
+combo4 <- combo3 %>% select(-income16)
+
+# Accuracy: 0.4649123; Loss: 1.5686/0.3377
+combo4_train_test <- train_test_split(combo4)
+classification_report(combo4_train_test)
+
+# Decrease Epochs
+# Accuracy: 0.4824561; Loss: 1.262/0.4785
+classification_report(combo4_train_test, epochs=25)
+
+combo5 <- combo4 %>% select(-age)
+
+# Accuracy: 0.5; Loss: 1.7151/0.3459
+combo5_train_test <- train_test_split(combo5)
+classification_report(combo5_train_test)
+
+# Edit hyperparameters
+# Accuracy: 0.505848; Loss: 1.5208/0.4098
+classification_report(combo5_train_test, u1=32, u2=32)
+
+# Check for underlying structure
+# 3 clusters with CH index is good. Data is likely being grouped by happiness
+# level which is okay. These would be fine predictors
+# race, marital, life, health, relig, educ
+# Silhouette of 0.1 with CH index of 8
+get_metrics(combo5)
+
+```
+
+## Characteristic Pruning ANN Trials
+
+```{r}
+
+# We have a good baseline. Now let's find the right predictive characteristics!
+# Recall that combo5 elucidated just life, so we'll skip that.
+char_prune1 <- clean_data(c("happy", "race", "marital", "life", "trust", "obey", 
+                       "workhard", "feeldown", "relig", "health", "educ")) %>% 
+  select(-id)
+
+# Life, Trust, Obey, Workhard, Feeldown
+# Accuracy: 0.4556962; Loss: 1.8904/0.0533
+cp1_train_test <- train_test_split(char_prune1)
+classification_report(cp1_train_test)
+
+#Trust, Obey, Workhard, Feeldown
+# Accuracy: 0.4683544; Loss: 2.1982/0.0838
+char_prune2 <- char_prune1 %>% select(-life)
+cp2_train_test <- train_test_split(char_prune2)
+classification_report(cp2_train_test)
+
+# Obey, Workhard, Feeldown
+# Accuracy: 0.4303797; Loss: 2.1235/0.0868
+char_prune3 <- char_prune2 %>% select(-trust)
+cp3_train_test <- train_test_split(char_prune3)
+classification_report(cp3_train_test)
+
+# Workhard, Feeldown
+# Accuracy: 0.4556962; Loss: 1.9851/0.1043
+char_prune4 <- char_prune3 %>% select(-obey)
+cp4_train_test <- train_test_split(char_prune4)
+classification_report(cp4_train_test)
+
+# Feeldown ONLY
+# Accuracy: 0.4303797; Loss: 1.6741/0.1465
+char_prune5 <- char_prune4 %>% select(-workhard)
+cp5_train_test <- train_test_split(char_prune5)
+classification_report(cp5_train_test)
+
+# No characteristics
+# Accuracy: 0.4683544; Loss: 1.3112/0.3278
+char_prune6 <- char_prune5 %>% select(-feeldown)
+cp6_train_test <- train_test_split(char_prune6)
+classification_report(cp6_train_test)
+
+# Trust ONLY
+# Accuracy: 0.4810127; Loss: 1.8213/0.1659
+char_prune7 <- char_prune1 %>% select(-life, -obey, -workhard, -feeldown)
+cp7_train_test <- train_test_split(char_prune7)
+classification_report(cp7_train_test)
+
+# Obey ONLY
+# Accuracy: 0.443038; Loss: 1.7706/0.2139
+char_prune8 <- char_prune1 %>% select(-life, -trust, -workhard, -feeldown)
+cp8_train_test <- train_test_split(char_prune8)
+classification_report(cp8_train_test)
+
+# Workhard ONLY
+# Accuracy: 0.5063291; Loss: 1.7162/0.1635
+char_prune9 <- char_prune1 %>% select(-life, -trust, -obey, -feeldown)
+cp9_train_test <- train_test_split(char_prune9)
+classification_report(cp9_train_test)
+
+# Most effective were Workhard and life
+# Accuracy: 0.5189873; Loss: 1.9146/0.1026
+# Adding workhard improved accuracy but worsened loss
+char_prune10 <- char_prune1 %>% select(-trust, -obey, -feeldown)
+cp10_train_test <- train_test_split(char_prune10)
+classification_report(cp10_train_test)
+
+# Check to see if the underlying structure can show us anything
+# Silhouettes are effectively 0
+# We have ineffective clusters/no underlying structure. This goes against
+# our expectation that there is at least 3 clusters corresponding to the 3
+# different happiness levels. Introducing Workhard was a BAD idea.
+get_metrics(char_prune10)
+
+```
+
+## Religious Pruning ANN Trials
+
+```{r}
+
+# Return to the best model. Repeat process for religious characteristics
+# Recall that combo5 elucidated just relig, so we'll skip that.
+reli_prune1 <- clean_data(c("happy", "race", "marital", "life", "relig", 
+                            "attend", "reliten", "pray", "god", "health", 
+                            "educ")) %>% 
+  select(-id)
+
+# Life, Trust, Obey, Workhard, Feeldown
+# Accuracy: 0.5063291; Loss: 2.623/0.0192
+rp1_train_test <- train_test_split(reli_prune1)
+classification_report(rp1_train_test)
+
+# Attend, Reliten, Pray, God
+# Accuracy: 0.4746835; Loss: 2.9902/0.0218
+reli_prune2 <- reli_prune1 %>% select(-relig)
+rp2_train_test <- train_test_split(reli_prune2)
+classification_report(rp2_train_test)
+
+# Reliten, Pray, God
+# Accuracy: 0.5189873; Loss: 1.5575/0.0947
+reli_prune3 <- reli_prune2 %>% select(-attend)
+rp3_train_test <- train_test_split(reli_prune3)
+classification_report(rp3_train_test)
+
+# Pray, God
+# Accuracy: 0.4050633; Loss: 2.0074/0.1352
+reli_prune4 <- reli_prune3 %>% select(-reliten)
+rp4_train_test <- train_test_split(reli_prune4)
+classification_report(rp4_train_test)
+
+# God ONLY
+# Accuracy: 0.4746835; Loss: 1.7045/0.2739
+reli_prune5 <- reli_prune4 %>% select(-pray)
+rp5_train_test <- train_test_split(reli_prune5)
+classification_report(rp5_train_test)
+
+# Attend ONLY
+# Accuracy: 0.4113924; Loss: 1.595/0.1791
+reli_prune6 <- reli_prune1 %>% select(-relig, -reliten, -pray, -god)
+rp6_train_test <- train_test_split(reli_prune6)
+classification_report(rp6_train_test)
+
+# Reliten ONLY
+# Accuracy: 0.4746835; Loss: 1.8813/0.2605
+reli_prune7 <- reli_prune1 %>% select(-relig, -attend, -pray, -god)
+rp7_train_test <- train_test_split(reli_prune7)
+classification_report(rp7_train_test)
+
+# Pray ONLY
+# Accuracy: 0.4493671; Loss: 1.4417/0.2502
+reli_prune8 <- reli_prune1 %>% select(-relig, -attend, -reliten, -god)
+rp8_train_test <- train_test_split(reli_prune8)
+classification_report(rp8_train_test)
+
+# Consider how (Reliten, Pray, God) was the most accurate model
+# Test Relig, Reliten, Pray, God
+# Accuracy: 0.4873418; Loss: 2.2278/0.0514
+reli_prune9 <- reli_prune1 %>% select(-attend)
+rp9_train_test <- train_test_split(reli_prune9)
+classification_report(rp9_train_test)
+
+# Reliten, Pray, God is most effective. Check underlying structure
+# 0.13 Silhouette with 2 CH. Not the best... 
+get_metrics(reli_prune3)
+
+```
+
+## Health Pruning ANN Trials
+
+```{r}
+
+# Return to the best model (reli_prune3). Repeat process for health characteristics
+# Recall that combo5 elucidated just health, so we'll skip that.
+health_prune1 <- clean_data(c("happy", "race", "marital", "life", "reliten", 
+                            "pray", "god", "health", "disblty", "hlthprb", 
+                            "docvst", "educ")) %>% 
+  select(-id)
+
+# Health, Disblty, Hlthprb, Docvst
+# Accuracy: 0.4807692; Loss: 1.8811/0.0209
+hp1_train_test <- train_test_split(health_prune1)
+classification_report(hp1_train_test)
+
+# Disblty, Hlthprb, Docvst
+# Accuracy: 0.5128205; Loss: 2.8312/0.016
+health_prune2 <- health_prune1 %>% select(-health)
+hp2_train_test <- train_test_split(health_prune2)
+classification_report(hp2_train_test)
+
+# Hlthprb, Docvst
+# Accuracy: 0.4166667; Loss: 2.1122/0.0415
+health_prune3 <- health_prune2 %>% select(-disblty)
+hp3_train_test <- train_test_split(health_prune3)
+classification_report(hp3_train_test)
+
+# Docvst ONLY
+# Accuracy: 0.5; Loss: 2.2872/0.0669
+health_prune4 <- health_prune3 %>% select(-hlthprb)
+hp4_train_test <- train_test_split(health_prune4)
+classification_report(hp4_train_test)
+
+# Disblty ONLY
+# Accuracy: 0.4358974; Loss: 2.5532/0.129
+health_prune5 <- health_prune1 %>% select(-health, -hlthprb, -docvst)
+hp5_train_test <- train_test_split(health_prune5)
+classification_report(hp5_train_test)
+
+# Hlthprb ONLY
+# Accuracy: 0.5; Loss: 2.3097/0.061
+health_prune6 <- health_prune1 %>% select(-health, -disblty, -docvst)
+hp6_train_test <- train_test_split(health_prune6)
+classification_report(hp6_train_test)
+
+# Health, Hlthprb
+# Accuracy: 0.3717949; Loss: 2.0391/0.0365
+health_prune7 <- health_prune1 %>% select(-disblty, -docvst)
+hp7_train_test <- train_test_split(health_prune7)
+classification_report(hp7_train_test)
+
+# Health, Hlthprb
+# Accuracy: 0.4679487; Loss: 1.7118/0.0835
+health_prune8 <- health_prune1 %>% select(-disblty, -hlthprb)
+hp8_train_test <- train_test_split(health_prune8)
+classification_report(hp8_train_test)
+
+```
+
+The best model incporates the happy, race, marital, life, reliten, pray, god, health, and educ variables.
+
+## Wealth Pruning ANN Trials
+
+```{r}
+
+# Return to the best model (reli_prune3). Reintroduce income
+# Recall that combo5 elucidated just health, so we'll skip that.
+wealth_prune1 <- clean_data(c("happy", "race", "marital", "life", "reliten", 
+                            "pray", "god", "health", "income16", "rincom16", 
+                            "satfin", "educ")) %>% 
+  select(-id)
+
+# income16, rincom16, satfin
+# Accuracy: 0.4938272; Loss: 1.9702/0.0091
+wp1_train_test <- train_test_split(wealth_prune1)
+classification_report(wp1_train_test)
+
+# rincom16, satfin
+# Accuracy: 0.4691358; Loss: 1.9486/0.0129
+wealth_prune2 <- wealth_prune1 %>% select(-income16)
+wp2_train_test <- train_test_split(wealth_prune2)
+classification_report(wp2_train_test)
+
+# satfin ONLY
+# Accuracy: 0.5061728; Loss: 2.0769/0.0201
+wealth_prune3 <- wealth_prune2 %>% select(-rincom16)
+wp3_train_test <- train_test_split(wealth_prune3)
+classification_report(wp3_train_test)
+
+# income16 ONLY (Including it again since we changed other variables)
+# Accuracy: 0.4567901; Loss: 2.3366/0.0156
+wealth_prune4 <- wealth_prune1 %>% select(-rincom16, -satfin)
+wp4_train_test <- train_test_split(wealth_prune4)
+classification_report(wp4_train_test)
+
+# rincom16 ONLY
+# Accuracy: 0.4691358; Loss: 2.4719/0.0168
+wealth_prune5 <- wealth_prune1 %>% select(-income16, -satfin)
+wp5_train_test <- train_test_split(wealth_prune5)
+classification_report(wp5_train_test)
+
+```
+
+Adding wealth didn't improve anything!
+
+## Best Model ANN Trials
+
+```{r}
+
+# Redefine the baseline best ANN with combinations across groupings
+# Accuracy: 0.5220126; Loss: 1.9606/0.0823
+best_model1 <- clean_data(c("happy", "race", "marital", "life", "reliten", 
+                            "pray", "god", "health", "educ")) %>% select(-id)
+bm1_train_test <- train_test_split(best_model1)
+classification_report(bm1_train_test)
+
+# Reintroduce age
+# Accuracy: 0.5430464; Loss: 1.7395/0.1005
+best_model2 <- clean_data(c("happy", "age", "race", "marital", "life", "reliten", 
+                            "pray", "god", "health", "educ")) %>% select(-id)
+bm2_train_test <- train_test_split(best_model2)
+classification_report(bm2_train_test)
+
+# Underlying structure implies best # clusters is 2.
+get_metrics(best_model2)
+
+# Reintroduce childs
+# Accuracy: 0.490566; Loss: 1.7998/0.0273
+best_model3 <- clean_data(c("happy", "childs", "race", "marital", "life",
+                            "reliten", "pray", "god", "health", "educ")) %>% 
+  select(-id)
+bm3_train_test <- train_test_split(best_model3)
+classification_report(bm3_train_test)
+
+# Underlying structure implies best # clusters is 2.
+get_metrics(best_model3)
+
+# Postlife
+# Accuracy: 0.3873239; Loss: 2.0048/0.0734
+best_model4 <- clean_data(c("happy", "postlife", "race", "marital", "life",
+                            "reliten", "pray", "god", "health", "educ")) %>% 
+  select(-id)
+bm4_train_test <- train_test_split(best_model4)
+classification_report(bm4_train_test)
+
+# Age, Childs
+# Accuracy: 0.397351; Loss: 1.4224/0.0458
+best_model4 <- clean_data(c("happy", "age", "childs", "race", "marital", "life",
+                            "reliten", "pray", "god", "health", "educ")) %>% 
+  select(-id)
+bm4_train_test <- train_test_split(best_model4)
+classification_report(bm4_train_test)
+
+# Age, Postlife
+# Accuracy: 0.4926471; Loss: 2.0702/0.1098
+best_model5 <- clean_data(c("happy", "age", "postlife", "race", "marital", 
+                            "life", "reliten", "pray", "god", "health", 
+                            "educ")) %>% select(-id)
+bm5_train_test <- train_test_split(best_model5)
+classification_report(bm5_train_test)
+
+```
+
+## Individual Model ANN Trials
+
+```{r}
+
+ind_model <- clean_data(c("happy", "race")) %>% select(-id) # Accuracy: 0.5447088
+ind_model <- clean_data(c("happy", "marital")) %>% select(-id) # Accuracy: 0.5555556
+ind_model <- clean_data(c("happy", "life")) %>% select(-id) # Accuracy: 0.5899633
+ind_model <- clean_data(c("happy", "reliten")) %>% select(-id) # Accuracy: 0.5477099
+ind_model <- clean_data(c("happy", "pray")) %>% select(-id) # Accuracy: 0.5322976
+ind_model <- clean_data(c("happy", "god")) %>% select(-id) # Accuracy: 0.5520196
+ind_model <- clean_data(c("happy", "health")) %>% select(-id) # Accuracy: 0.5501618
+ind_model <- clean_data(c("happy", "educ")) %>% select(-id) # Accuracy: 0.5309446
+ind_model <- clean_data(c("happy", "postlife")) %>% select(-id) # Accuracy: 0.5638298
+ind_model <- clean_data(c("happy", "age")) %>% select(-id) # Accuracy: 0.5546942
+ind_model <- clean_data(c("happy", "childs")) %>% select(-id) # Accuracy: 0.5482563
+ind_model <- clean_data(c("happy", "socbar")) %>% select(-id) # Accuracy: 0.56691
+ind_model <- clean_data(c("happy", "yrlvmus")) %>% select(-id) # Accuracy: 0.516
+ind_model <- clean_data(c("happy", "yrartxbt")) %>% select(-id) # Accuracy: 0.4939759
+ind_model <- clean_data(c("happy", "yrmovie")) %>% select(-id) # Accuracy: 0.5458167
+ind_model <- clean_data(c("happy", "yrcreat")) %>% select(-id) # Accuracy: 0.58
+ind_model <- clean_data(c("happy", "yrrdg")) %>% select(-id) # Accuracy: 0.5059761
+ind_model <- clean_data(c("happy", "yrtour")) %>% select(-id) # Accuracy: 0.5261044
+ind_model <- clean_data(c("happy", "yrstmus")) %>% select(-id) # Accuracy: 0.562249
+ind_model <- clean_data(c("happy", "yrarmus")) %>% select(-id) # Accuracy: 0.5322581
+ind_model <- clean_data(c("happy", "yrstpo")) %>% select(-id) # Accuracy: 0.516
+ind_model <- clean_data(c("happy", "yrarpo")) %>% select(-id) # Accuracy: 0.504
+ind_model <- clean_data(c("happy", "yrclass")) %>% select(-id) # Accuracy: 0.508
+ind_model <- clean_data(c("happy", "yrpod")) %>% select(-id) # Accuracy: 0.476
+ind_model <- clean_data(c("happy", "income16")) %>% select(-id) # Accuracy: 0.5255941
+ind_model <- clean_data(c("happy", "rincom16")) %>% select(-id) # Accuracy: 0.5541311
+ind_model <- clean_data(c("happy", "satfin")) %>% select(-id) # Accuracy: 0.5377742
+ind_model <- clean_data(c("happy", "conrinc")) %>% select(-id) # Accuracy: 0.5384615
+ind_model <- clean_data(c("happy", "trust")) %>% select(-id) # Accuracy: 0.5414365
+ind_model <- clean_data(c("happy", "obey")) %>% select(-id) # Accuracy: 0.5435323
+ind_model <- clean_data(c("happy", "workhard")) %>% select(-id) # Accuracy: 0.5161692
+ind_model <- clean_data(c("happy", "feeldown")) %>% select(-id) # Accuracy: 0.5759312
+ind_model <- clean_data(c("happy", "attend")) %>% select(-id) # Accuracy: 0.5485714
+ind_model <- clean_data(c("happy", "relig")) %>% select(-id) # Accuracy: 0.5517241
+ind_model <- clean_data(c("happy", "disblty")) %>% select(-id) # Accuracy: 0.5073892
+ind_model <- clean_data(c("happy", "hlthprb")) %>% select(-id) # Accuracy: 0.5213033
+ind_model <- clean_data(c("happy", "docvst")) %>% select(-id) # Accuracy: 0.4975124
+ind_model <- clean_data(c("happy", "socrel")) %>% select(-id) # Accuracy: 0.5953827
+ind_model <- clean_data(c("happy", "socommun")) %>% select(-id) # Accuracy: 0.5691748
+ind_model <- clean_data(c("happy", "socfrend")) %>% select(-id) # Accuracy: 0.5656934
+
+ind_model <- clean_data(c("happy", "socrel", "yrcreat", "life")) %>% 
+  select(-id) # Accuracy: 0.5487805
+
+ind_train_test <- train_test_split(ind_model)
+classification_report(ind_train_test)
+
+```
+
+## Final Model ANN Trial
+
+```{r}
+
+set.seed(123)
+
+ncol(data)
+
+finalmodel <- clean_data(c("happy", "age", "race", "marital", "life", "reliten", 
+                            "pray", "god", "health", "educ")) %>% select(-id)
+
+final_train_test <- train_test_split(finalmodel)
+#Accuracy: 0.589404; Loss: 1.4051/0.2994
+classification_report(final_train_test, epochs=30, u1=32, u2=16)
+get_metrics(finalmodel)
+
+```
