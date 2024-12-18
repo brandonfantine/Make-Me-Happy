@@ -939,8 +939,6 @@ classification_report(ind_train_test)
 
 set.seed(123)
 
-ncol(data)
-
 finalmodel <- clean_data(c("happy", "age", "race", "marital", "life", "reliten", 
                             "pray", "god", "health", "educ")) %>% select(-id)
 
